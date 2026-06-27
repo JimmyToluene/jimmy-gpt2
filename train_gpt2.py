@@ -4,6 +4,12 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # ---------------------------------------------------------------
+class CasualSelfAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0 # embedding dimension must be divisible by the number of heads
+        # key, query, value projection/weights for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
 class MLP(nn.Module):
 
     def __init__(self, config):
