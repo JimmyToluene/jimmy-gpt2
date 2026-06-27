@@ -93,6 +93,22 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # final, unnormalized logits layer
 
+    def forward(self, idx):
+        # idx of the shape (B,T)
+        B, T = idx.size()
+        assert T <= self.config.block_size,f"Cannot fwd seq of length {T}, block size is {self.config.block_size}"
+        # forward the token and positional embd
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape(T)
+        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.transformer.wte(idx)
+        x = pos_emb + tok_emb
+        # forward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
+
     @classmethod
     def from_pretrained(cls, model_type):
         """
@@ -126,19 +142,33 @@ class GPT(nn.Module):
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a difference in parameter naming
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same
-        transposed = ['attn_c_attn.weight', 'attn_c_proj.weight', 'mlp_c_fc.weight', 'mlp_c_proj.weight']
-
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
-                    sd[k].copy_(sd_hf(k).t())
+                    sd[k].copy_(sd_hf[k].t())
             else:
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
+                    sd[k].copy_(sd_hf[k])
 
         return model
 
+# -----------------------------
+num_return_sequence = 5
+max_length = 30
+
+model = GPT.from_pretrained('gpt2')
+model.eval()
+model.to('cuda')
+
+# Prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hi, I am a language model")
+tokens = torch.tensor(tokens,dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequence,1)
+x = tokens.to('cuda')
