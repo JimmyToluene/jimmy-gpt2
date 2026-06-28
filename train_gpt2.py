@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 # ---------------------------------------------------------------
 class CausalSelfAttention(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0 # embedding dimension must be divisible by the number of heads
@@ -41,7 +42,6 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.c_proj(y)
         return y
-
 
 class MLP(nn.Module):
 
@@ -93,7 +93,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # final, unnormalized logits layer
 
-    def forward(self, idx):
+    def forward(self, idx,target=None):
         # idx of the shape (B,T)
         B, T = idx.size()
         assert T <= self.config.block_size,f"Cannot fwd seq of length {T}, block size is {self.config.block_size}"
@@ -105,9 +105,13 @@ class GPT(nn.Module):
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
+        # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        loss = None
+        if target is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -157,18 +161,44 @@ class GPT(nn.Module):
 
         return model
 
-# -----------------------------
-num_return_sequence = 5
-max_length = 30
+# -------------------------------------------------------------------------------------------------------------------------------------------------
+# Autodetect the avail devices
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends,"mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using devices: {device}")
+device = 'cpu'
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
-
-# Prefix tokens
+# Get a data batch
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hi")
+with open('notebooks/input.txt','r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T+1])
+x = buf[:-1].view(B,T)
+y = buf[1:].view(B,T)
+
+# get logits
+model = GPT(GPTConfig())
+model.to(device)
+logits, loss = model(x, y)
+
+print(loss)
+print(logits.shape)
+import sys; sys.exit(0)
+
+# Prefix tokens
+model.eval()
+num_return_sequence = 5
+max_length = 30
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I am a lanuage model")
 tokens = torch.tensor(tokens,dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequence,1) # (5,8)
 x = tokens.to('cuda')
@@ -188,7 +218,7 @@ while x.size(1) < max_length:
         # do top-k sampling of 50 (hf pipeline default)
         topk_probs, topk_indices = torch.topk(probs,50,dim=-1)
         # select a token from the top-k prob
-        ix = torch.multinomial(topk_probs,1)
+        ix = torch.multinomial(topk_probs,1) # (B,1)
         # gather the token corresponding indices
         xcol = torch.gather(topk_indices,-1,ix) # (B,1)
         # append to the sequence
