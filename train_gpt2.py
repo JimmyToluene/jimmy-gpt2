@@ -4,15 +4,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024  # context window size
-    vocab_size: int = 50257 # number of tokens: 50000 BPE merges + 256 bytes tokens + 1 EOS token
-    n_layer: int = 12 # number of layers
-    n_head: int = 12 # number of attention heads
-    n_embd: int = 768 # embedding dimension
-
 # ---------------------------------------------------------------
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -39,13 +32,15 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B,T,self.n_head,C // self.n_head).transpose(1,2) # (B, nh, T, hs)
         q = q.view(B,T,self.n_head,C // self.n_head).transpose(1,2) # (B, nh, T, hs)
         v = v.view(B,T,self.n_head,C // self.n_head).transpose(1,2) # (B, nh, T, hs)
+
         # attention (T,T) matrix for all the queries and keys
-        att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))
+        # att = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))
         # Apply the causal mask (predict next token model only mask)
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         # Apply softmax on last dim of attention matrix
-        att = F.softmax(att,dim=-1)
-        y = att @ v # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # att = F.softmax(att,dim=-1)
+        # y = att @ v # (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1,2).contiguous().view(B,T,C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -59,7 +54,6 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
-
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -80,6 +74,14 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024  # context window size
+    vocab_size: int = 50257 # number of tokens: 50000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
+    n_layer: int = 12 # number of layers
+    n_head: int = 12 # number of attention heads
+    n_embd: int = 768 # embedding dimension
 
 class GPT(nn.Module):
 
@@ -179,7 +181,6 @@ class GPT(nn.Module):
 
         return model
 
-
 # -------------------------------------------------------------------------------------------------------------------------------------------------
 import tiktoken
 class DataLoaderLite:
@@ -230,13 +231,30 @@ train_loader = DataLoaderLite(B=16,T=1024)
 torch.set_float32_matmul_precision('high')
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model) # torch.comile() like gcc for c, it compiles the whole model into a single object, and send to interpreter
 
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1: linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2: if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3: in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
 # Optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -244,12 +262,17 @@ for i in range(50):
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x,y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Calculate global norm for all parameters, prevent the model get too big shocks.
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1-t0) * 1000 # time difference in miliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"iter {i} loss {loss.item()}, dt: {dt:.2f}ms, tok/sec:{tokens_per_sec:.2f}")
+    print(f"step {step:4d} | loss {loss.item():.6f} | lr:{lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tok/sec:{tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
