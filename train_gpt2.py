@@ -232,6 +232,7 @@ torch.set_float32_matmul_precision('high')
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model) # torch.comile() like gcc for c, it compiles the whole model into a single object, and send to interpreter
 
 # Optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
